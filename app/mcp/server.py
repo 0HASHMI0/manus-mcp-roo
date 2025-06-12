@@ -7,34 +7,26 @@ logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stde
 import argparse
 import asyncio
 import atexit
-import json
+import jsonpickle
 from inspect import Parameter, Signature
 from typing import Any, Dict, Optional
-
+from app.tool.base import ToolResult, ToolFailure
 from mcp.server.fastmcp import FastMCP
 
 from app.logger import logger
+from app.tool.tool_collection import get_all_tools
 from app.tool.base import BaseTool
-from app.tool.bash import Bash
-from app.tool.browser_use_tool import BrowserUseTool
-from app.tool.str_replace_editor import StrReplaceEditor
-from app.tool.terminate import Terminate
-
-
 class MCPServer:
     """MCP Server implementation with tool registration and management."""
+
+    # Define the path prefix for tool exposure
+    TOOL_PATH_PREFIX = "tool"
 
     def __init__(self, name: str = "openmanus"):
         self.server = FastMCP(name)
         self.tools: Dict[str, BaseTool] = {}
-
-        # Initialize standard tools
-        self.tools["bash"] = Bash()
-        self.tools["browser"] = BrowserUseTool()
-        self.tools["editor"] = StrReplaceEditor()
-        self.tools["terminate"] = Terminate()
-
-    def register_tool(self, tool: BaseTool, method_name: Optional[str] = None) -> None:
+        self._load_tools() # Load tools upon initialization
+    def register_tool(self, tool, method_name: Optional[str] = None) -> None:
         """Register a tool with parameter validation and documentation."""
         tool_name = method_name or tool.name
         tool_param = tool.to_param()
@@ -43,17 +35,22 @@ class MCPServer:
         # Define the async function to be registered
         async def tool_method(**kwargs):
             logger.info(f"Executing {tool_name}: {kwargs}")
-            result = await tool.execute(**kwargs)
+            try:
+                # Validate parameters against schema before execution
+                self._validate_parameters(tool_name, kwargs, tool_method._parameter_schema)
+                result = await tool.execute(**kwargs)
+                logger.info(f"Result of {tool_name}: {result}")
+                # Return the result directly. FastMCP handles JSON serialization if needed.
+                return result
+            except ValueError as ve:
+                logger.error(f"Parameter validation error for tool {tool_name}: {ve}")
+                return {"error": f"Parameter validation error: {ve}"}
+            except Exception as e:
+                logger.error(f"Error executing tool {tool_name}: {e}")
+                return {"error": str(e)}
 
-            logger.info(f"Result of {tool_name}: {result}")
 
-            # Handle different types of results (match original logic)
-            if hasattr(result, "model_dump"):
-                return json.dumps(result.model_dump())
-            elif isinstance(result, dict):
-                return json.dumps(result)
-            return result
-
+        # Set method metadata for FastMCP registration
         # Set method metadata
         tool_method.__name__ = tool_name
         tool_method.__doc__ = self._build_docstring(tool_function)
@@ -72,7 +69,7 @@ class MCPServer:
         }
 
         # Register with server
-        self.server.tool()(tool_method)
+        self.server.tool(f"{self.TOOL_PATH_PREFIX}/{tool_name}")(tool_method)
         logger.info(f"Registered tool: {tool_name}")
 
     def _build_docstring(self, tool_function: dict) -> str:
@@ -135,6 +132,19 @@ class MCPServer:
 
         return Signature(parameters=parameters)
 
+    def _validate_parameters(self, tool_name: str, params: Dict[str, Any], schema: Dict[str, Any]):
+        """Validate parameters against the tool's parameter schema."""
+        required_params = [name for name, details in schema.items() if details.get("required")]
+        missing_required = [param for param in required_params if param not in params]
+        if missing_required:
+            raise ValueError(f"Missing required parameters: {', '.join(missing_required)}")
+
+        # Basic type checking (can be expanded for more complex schemas)
+        for param_name, param_value in params.items():
+            if param_name in schema:
+                expected_type = schema[param_name].get("type")
+                # Add type checking logic here based on expected_type if needed
+
     async def cleanup(self) -> None:
         """Clean up server resources."""
         logger.info("Cleaning up resources")
@@ -142,9 +152,13 @@ class MCPServer:
         if "browser" in self.tools and hasattr(self.tools["browser"], "cleanup"):
             await self.tools["browser"].cleanup()
 
+    def _load_tools(self) -> None:
+        """Load all tools using the tool collection."""
+        self.tools = get_all_tools()
+
     def register_all_tools(self) -> None:
         """Register all tools with the server."""
-        for tool in self.tools.values():
+        for tool_name, tool in self.tools.items():
             self.register_tool(tool)
 
     def run(self, transport: str = "stdio") -> None:
